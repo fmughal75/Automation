@@ -1,0 +1,30 @@
+lab:
+  title: iosxe-evpn-vxlan-mini
+  description: "IOS-XE eBGP underlay + EVPN overlay + VXLAN NVE mini lab"
+  notes: "Import into CML2. Ensure iosxe node definition exists."
+topology:
+  nodes:
+    - label: SPINE1
+      node_definition: iosxe
+      x: 400
+      y: 150
+    - label: LEAF1
+      node_definition: iosxe
+      x: 200
+      y: 350
+    - label: LEAF2
+      node_definition: iosxe
+      x: 600
+      y: 350
+
+  links:
+    - nodes:
+        - node: LEAF1
+          interface: GigabitEthernet1
+        - node: SPINE1
+          interface: GigabitEthernet1
+    - nodes:
+        - node: LEAF2
+          interface: GigabitEthernet1
+        - node: SPINE1
+          interface: GigabitEthernet2
