@@ -22,8 +22,11 @@
 9. [Phase 8: Three-Server Consolidation and Migration](#9-phase-8-consolidation)
 10. [Phase 9: Monitoring Stack — Prometheus, Grafana, SNMP](#10-phase-9-monitoring)
 11. [Phase 10: AIOps Self-Healing Pipeline](#11-phase-10-aiops)
-12. [Challenges Encountered and Resolutions](#12-challenges)
-13. [Final Service Map and Verification](#13-final-map)
+12. [Phase 11: Distributed AI/ML Infrastructure — GPU Nodes + RAG + Distributed Training](#14-phase-11-gpu)
+13. [Phase 12: Multi-Agent AI System with OpenClaw](#15-phase-12-multi-agent)
+14. [Phase 13: Kubernetes + Calico BGP — Fabric-to-AI Bridge](#16-phase-13-k8s)
+15. [Challenges Encountered and Resolutions](#12-challenges)
+16. [Final Architecture — Complete System Map](#13-final-map)
 
 ---
 
@@ -669,7 +672,680 @@ Initial OPA rules were too restrictive, blocking valid remediations.
 
 ---
 
-## 12. Challenges Encountered and Resolutions <a name="12-challenges"></a>
+## 12. Phase 11: Distributed AI/ML Infrastructure — GPU Nodes + RAG <a name="14-phase-11-gpu"></a>
+
+### 12.1 Node Architecture
+
+The AI/ML infrastructure spans three physical/virtual nodes, each with a dedicated role following the separation-of-concerns principle:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    DISTRIBUTED AI/ML CLUSTER                        │
+│                                                                     │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
+│  │  INTEL NODE       │  │  GPU NODE 1       │  │  GPU NODE 2       │  │
+│  │  192.168.86.124   │  │  192.168.86.56    │  │  192.168.86.118   │  │
+│  │                   │  │                   │  │                   │  │
+│  │  ┌─────────────┐  │  │  ┌─────────────┐  │  │  ┌─────────────┐  │
+│  │  │ RAG Engine  │  │  │  │ Qwen2 1.5B  │  │  │  │ vLLM Server │  │
+│  │  │ Ingestion   │  │  │  │ Fine-tuning  │  │  │  │ Inference   │  │
+│  │  └─────────────┘  │  │  │ (LoRA)       │  │  │  │ (Primary)   │  │
+│  │  ┌─────────────┐  │  │  └─────────────┘  │  │  └─────────────┘  │
+│  │  │ Qdrant      │  │  │  ┌─────────────┐  │  │  ┌─────────────┐  │
+│  │  │ Vector DB   │  │  │  │ Ollama       │  │  │  │ OpenAI API  │  │
+│  │  │ Port 6333   │  │  │  │ Fallback     │  │  │  │ Compatible  │  │
+│  │  └─────────────┘  │  │  │ Inference    │  │  │  │ Port 8000   │  │
+│  │  ┌─────────────┐  │  │  └─────────────┘  │  │  └─────────────┘  │
+│  │  │ Agent       │  │  │                   │  │                   │  │
+│  │  │ Controller  │  │  │  Role: TRAINING   │  │  Role: INFERENCE  │  │
+│  │  └─────────────┘  │  │                   │  │                   │  │
+│  │  Role: BRAIN      │  │                   │  │                   │  │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘  │
+│                              │                       │              │
+│                    ┌─────────┴───────────────────────┘              │
+│                    │         EVPN-VXLAN FABRIC                      │
+│            ┌───────┴───────┐          ┌───────────────┐            │
+│            │   LEAF-01     │          │   LEAF-02     │            │
+│            │  Eth3→GPU1    │          │  Eth3→GPU2    │            │
+│            └───────────────┘          └───────────────┘            │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 12.2 Node Roles and Separation
+
+| Node | IP | Role | Key Services |
+|------|-----|------|-------------|
+| Intel Node | 192.168.86.124 | RAG Control Plane (Brain) | Qdrant, ingestion, agent controller, FastAPI |
+| GPU Node 1 | 192.168.86.56 | Training | Qwen2 1.5B LoRA fine-tuning via Ollama, fallback inference |
+| GPU Node 2 | 192.168.86.118 | Primary Inference | vLLM server, OpenAI-compatible API |
+
+### 12.3 Intel Node Setup — RAG Control Plane
+
+The Intel node serves as the central brain: it ingests data, stores embeddings in Qdrant, routes queries to GPU nodes, and orchestrates the agent pipeline.
+
+**Step 1: Base Installation**
+
+```bash
+sudo apt update && sudo apt upgrade -y
+sudo apt install python3-pip python3-venv docker.io git -y
+sudo systemctl enable docker && sudo systemctl start docker
+```
+
+**Step 2: Python Environment**
+
+```bash
+python3 -m venv rag_env
+source rag_env/bin/activate
+pip install --upgrade pip
+pip install qdrant-client sentence-transformers fastapi uvicorn requests
+```
+
+**Step 3: Qdrant Vector Database**
+
+```bash
+docker run -d \
+  --name qdrant \
+  -p 6333:6333 \
+  -v ~/qdrant_data:/qdrant/storage \
+  qdrant/qdrant
+```
+
+Verify: `curl http://192.168.86.124:6333`
+
+**Step 4: Configuration**
+
+```python
+# config.py
+QDRANT_HOST = "192.168.86.124"
+GPU1_API = "http://192.168.86.56:11434"    # Ollama (training node / fallback)
+GPU2_API = "http://192.168.86.118:8000"    # vLLM (primary inference)
+MODEL = "qwen2:1.5b"
+```
+
+**Step 5: Run Ingestion**
+
+```bash
+cd ~/rag
+source ../rag_env/bin/activate
+python3 ingest.py
+```
+
+### 12.4 GPU Node 2 — vLLM Primary Inference
+
+GPU Node 2 runs vLLM for high-performance inference with an OpenAI-compatible API:
+
+```bash
+pip install vllm
+
+python3 -m vllm.entrypoints.openai.api_server \
+  --model Qwen/Qwen2-1.5B \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --gpu-memory-utilization 0.9
+```
+
+Verify: `curl http://192.168.86.118:8000/v1/models`
+
+### 12.5 GPU Node 1 — Training + Fallback Inference
+
+GPU Node 1 focuses on LoRA fine-tuning with Ollama available as inference fallback:
+
+```bash
+# Training: Run fine-tuning scripts
+# Fallback inference:
+ollama run qwen2:1.5b
+```
+
+**Important:** Do not overload GPU1 with inference requests — keep it primarily for training.
+
+### 12.6 Intelligent GPU Routing
+
+The Intel node routes queries to the best available GPU, with automatic fallback:
+
+```python
+import requests
+
+def ask_llm(prompt):
+    try:
+        # Try GPU2 first (vLLM — fast, primary)
+        res = requests.post("http://192.168.86.118:8000/v1/completions", json={
+            "model": "Qwen/Qwen2-1.5B",
+            "prompt": prompt,
+            "max_tokens": 200
+        }, timeout=5)
+        return res.json()
+    except:
+        # Fallback to GPU1 (Ollama — slower, backup)
+        res = requests.post("http://192.168.86.56:11434/api/generate", json={
+            "model": "qwen2:1.5b",
+            "prompt": prompt,
+            "stream": False
+        })
+        return res.json()["response"]
+```
+
+### 12.7 Self-Improving RAG Pipeline
+
+The RAG pipeline operates on a nightly cycle across both GPU nodes:
+
+```
+┌────────────────────────────────────────────────────────┐
+│              SELF-IMPROVING RAG PIPELINE                │
+│                                                        │
+│  ┌──────────┐    ┌──────────┐    ┌──────────────────┐  │
+│  │ Multi-   │    │ Qdrant   │    │ Q/A Generation   │  │
+│  │ Source   │───▶│ Ingest   │───▶│ (Qwen scoring)   │  │
+│  │ Feeds    │    │ Embed    │    │                  │  │
+│  └──────────┘    └──────────┘    └────────┬─────────┘  │
+│       │                                    │           │
+│  Sources:                          ┌───────▼─────────┐ │
+│  • News APIs                       │ Quality Filter  │ │
+│  • Telegram                        │ Score > 0.7     │ │
+│  • ArXiv                           └───────┬─────────┘ │
+│  • PubMed                                  │           │
+│  • Financial filings               ┌───────▼─────────┐ │
+│  • Market data                     │ Nightly LoRA    │ │
+│                                    │ Fine-tuning     │ │
+│  5 Sectors:                        │ (GPU Node 1)    │ │
+│  • AI/ML                           └─────────────────┘ │
+│  • Networking/Cyber                                    │
+│  • Finance/Trading                                     │
+│  • Geopolitics                                         │
+│  • Science                                             │
+└────────────────────────────────────────────────────────┘
+```
+
+### 12.8 Previous Issues Resolved
+
+| Issue | Root Cause | Fix |
+|-------|-----------|-----|
+| Wrong model name errors | Ollama vs vLLM naming | Standardized to `Qwen/Qwen2-1.5B` for vLLM, `qwen2:1.5b` for Ollama |
+| GPU OOM crashes | Running inference + training on same GPU | Separated roles: GPU1=training, GPU2=inference |
+| Qdrant ID conflicts | Using sequential IDs | Switched to UUID |
+| Slow inference | Ingestion competing with inference | Moved ingestion to Intel node |
+
+### 12.9 Multi-Node Distributed LoRA Training (PyTorch + NCCL)
+
+This section documents the real-world engineering of a multi-node distributed training system — not a toy example, but actual debugging, stabilization, and production-readying of a distributed LoRA fine-tuning pipeline.
+
+#### 12.9.1 Distributed Training Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│            DISTRIBUTED LoRA TRAINING CLUSTER             │
+│                                                         │
+│  ┌─────────────────────┐    ┌─────────────────────┐    │
+│  │  NODE 1 — MASTER    │    │  NODE 2 — WORKER    │    │
+│  │  GPU Node 1 (.56)   │◄──►│  GPU Node 2 (.118)  │    │
+│  │                     │    │                     │    │
+│  │  ┌───────────────┐  │    │  ┌───────────────┐  │    │
+│  │  │    GPU 0      │  │    │  │    GPU 0      │  │    │
+│  │  │  Rank 0       │◄─┼────┼─►│  Rank 1       │  │    │
+│  │  │  LoRA Params  │  │    │  │  LoRA Params  │  │    │
+│  │  └───────────────┘  │    │  └───────────────┘  │    │
+│  │                     │    │                     │    │
+│  │  torchrun           │    │  torchrun           │    │
+│  │  --node_rank=0      │    │  --node_rank=1      │    │
+│  │  --master_addr=.56  │    │  --master_addr=.56  │    │
+│  │  --master_port=29500│    │  --master_port=29500│    │
+│  └─────────────────────┘    └─────────────────────┘    │
+│                                                         │
+│  Communication: NCCL over Ethernet (no InfiniBand)      │
+│  Synchronization: PyTorch DDP (DistributedDataParallel) │
+│  Backend: NCCL with P2P disabled for Ethernet           │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### 12.9.2 Environment Setup
+
+```bash
+# Python environment (both nodes)
+python3 -m venv /mnt/ai_disk/llm_env
+source /mnt/ai_disk/llm_env/bin/activate
+pip install --upgrade pip
+pip install torch transformers datasets peft accelerate
+```
+
+**NCCL Configuration (critical for Ethernet-based training):**
+
+```bash
+export NCCL_DEBUG=INFO
+export NCCL_SOCKET_IFNAME=eth0
+export GLOO_SOCKET_IFNAME=eth0
+export NCCL_IB_DISABLE=1      # No InfiniBand
+export NCCL_P2P_DISABLE=1     # Required for Ethernet
+```
+
+#### 12.9.3 Dataset Format
+
+The training dataset uses instruction-output pairs with explicit labels:
+
+```json
+{
+  "instruction": "Explain concept",
+  "input": "optional context",
+  "output": "expected response"
+}
+```
+
+The tokenization function must return `labels` alongside `input_ids` and `attention_mask` — omitting labels causes `ValueError: model did not return a loss`.
+
+```python
+def tokenize(example):
+    text = f"### Instruction:\n{example['instruction']}\n### Response:\n{example['output']}"
+    enc = tokenizer(text, truncation=True, max_length=512, padding="max_length")
+    return {
+        "input_ids": enc["input_ids"],
+        "attention_mask": enc["attention_mask"],
+        "labels": enc["input_ids"],  # Critical: must include labels
+    }
+```
+
+#### 12.9.4 Training Configuration
+
+```python
+from transformers import TrainingArguments
+
+training_args = TrainingArguments(
+    output_dir="/mnt/ai_disk/lora_output",
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=4,
+    num_train_epochs=1,
+    logging_steps=10,
+    save_steps=50,
+    fp16=True,
+    dataloader_num_workers=2,
+    report_to="none"
+)
+```
+
+#### 12.9.5 Multi-Node Execution
+
+**Master Node (GPU Node 1 — 192.168.86.56):**
+
+```bash
+torchrun \
+  --nproc_per_node=1 \
+  --nnodes=2 \
+  --node_rank=0 \
+  --master_addr=192.168.86.56 \
+  --master_port=29500 \
+  train_clean_fixed.py
+```
+
+**Worker Node (GPU Node 2 — 192.168.86.118):**
+
+```bash
+torchrun \
+  --nproc_per_node=1 \
+  --nnodes=2 \
+  --node_rank=1 \
+  --master_addr=192.168.86.56 \
+  --master_port=29500 \
+  train_clean_fixed.py
+```
+
+#### 12.9.6 Training Results
+
+```
+loss: 3.3 → 2.0    ✔ Correct learning
+grad_norm: stable   ✔ Stable gradients
+learning_rate: decaying ✔ No divergence
+```
+
+#### 12.9.7 Critical Issues and Fixes
+
+| Issue | Error | Root Cause | Fix |
+|-------|-------|-----------|-----|
+| No loss returned | `ValueError: model did not return a loss` | Dataset missing `labels` field | Add `"labels": enc["input_ids"]` to tokenizer output |
+| Typo crash | `unexpected keyword argument 'bfp16'` | Typo in TrainingArguments | Correct to `fp16=True` |
+| NCCL log confusion | Assumed NCCL logs meant errors | NCCL INFO logs are normal operation | Verify `Init COMPLETE` and `Connected all rings` = success |
+| Missing nvidia-smi | `command not found` | CLI tool not installed, GPU still functional | Validate GPU via training behavior and CUDA tensors, not CLI |
+| OOM on single node | GPU memory exhausted | Too many processes on one GPU | Separate training (GPU1) from inference (GPU2) |
+
+#### 12.9.8 Best Practices for Distributed Training
+
+**Distributed Setup:**
+- Always verify `Init COMPLETE` and `Connected all rings` in NCCL logs
+- Use static IP for `master_addr` — never hostname
+- Keep `master_port` consistent across all nodes (29500)
+
+**Dataset:**
+- Always include `input_ids`, `attention_mask`, and `labels`
+- Normalize empty fields; validate sample outputs before training
+
+**Training Stability:**
+- Monitor loss decreasing (no NaN), grad_norm stable
+- Use small batch size + gradient accumulation for memory efficiency
+- Enable gradient checkpointing: `model.gradient_checkpointing_enable()`
+
+**Performance Optimization:**
+- Increase `dataloader_num_workers=4` for data loading
+- Reduce NCCL log verbosity in production: `export NCCL_DEBUG=WARN`
+- Use mixed precision: `fp16=True`
+
+**Debugging:**
+- Always read the first error in stack traces, not the last
+- Separate infrastructure issues from code issues
+- Validate CUDA through training behavior, not CLI tools
+
+#### 12.9.9 Post-Training Pipeline
+
+```python
+# Step 1: Merge LoRA weights into base model
+model = model.merge_and_unload()
+
+# Step 2: Save merged model
+model.save_pretrained("final_model")
+tokenizer.save_pretrained("final_model")
+
+# Step 3: Test inference
+inputs = tokenizer("Explain AI", return_tensors="pt").to("cuda")
+outputs = model.generate(**inputs, max_new_tokens=200)
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+
+# Step 4: Deploy to vLLM for production serving
+# Copy final_model to GPU Node 2, serve via vLLM
+```
+
+#### 12.9.10 Scaling Path
+
+| Current | Next Step | Benefit |
+|---------|-----------|---------|
+| 2 nodes, 1 GPU each | 4+ nodes | Linear throughput scaling |
+| Ethernet NCCL | RoCE / InfiniBand | 10-100x communication speed |
+| LoRA only | Full fine-tune | Larger parameter updates |
+| Manual torchrun | K8s GPU operator | Automated job scheduling |
+| Single dataset | Multi-dataset pipeline | Broader model capability |
+
+---
+
+## 13. Phase 12: Multi-Agent AI System with OpenClaw <a name="15-phase-12-multi-agent"></a>
+
+### 13.1 Multi-Agent Architecture
+
+The multi-agent layer transforms the infrastructure from a single-purpose RAG system into a coordinated AI system where specialized agents collaborate to accomplish complex tasks.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                   MULTI-AGENT ORCHESTRATION                      │
+│                        (Intel Node)                              │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │                   PLANNER AGENT                            │  │
+│  │         Decomposes user requests into sub-tasks            │  │
+│  │         Routes to specialized agents                       │  │
+│  └──────────────┬───────────┬──────────────┬──────────────────┘  │
+│                 │           │              │                     │
+│    ┌────────────▼──┐  ┌────▼─────────┐  ┌▼──────────────────┐  │
+│    │  TOOL AGENT   │  │  RAG AGENT   │  │  NETWORK AGENT    │  │
+│    │               │  │              │  │                   │  │
+│    │ • Web crawler │  │ • Quran RAG  │  │ • BGP queries     │  │
+│    │ • API calls   │  │ • Arabic NLP │  │ • Interface stats │  │
+│    │ • File ops    │  │ • Scholarly  │  │ • EVPN state      │  │
+│    │ • Code exec   │  │   texts      │  │ • CVP telemetry   │  │
+│    └───────┬───────┘  └──────┬───────┘  └────────┬──────────┘  │
+│            │                 │                    │              │
+│            ▼                 ▼                    ▼              │
+│    ┌──────────────────────────────────────────────────────────┐  │
+│    │              GPU ROUTING LAYER                           │  │
+│    │   GPU2 (vLLM/fast) ←→ GPU1 (Ollama/fallback)           │  │
+│    └──────────────────────────────────────────────────────────┘  │
+│                              │                                   │
+│                    ┌─────────▼──────────┐                       │
+│                    │   RESPONSE         │                       │
+│                    │   SYNTHESIZER      │                       │
+│                    │   Combines agent   │                       │
+│                    │   outputs          │                       │
+│                    └────────────────────┘                       │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 13.2 Agent Definitions
+
+**Planner Agent** — The orchestrator. Receives user requests, breaks them into sub-tasks, determines which specialized agents to invoke, manages execution order, and synthesizes final responses.
+
+**Tool Execution Agent** — Handles real-world interactions:
+- Web crawling for live data gathering
+- API calls to external services
+- File system operations for data persistence
+- Code execution for computation tasks
+
+**RAG Agent (Quran + Classical Arabic)** — Specialized for Islamic scholarly texts:
+- Classical Arabic NLP pipeline (Lane's Lexicon, Lisan al-Arab, Mufradat al-Raghib)
+- Tafsir Ibn Kathir integration
+- Quran Corpus with morphological analysis
+- Semantic search via Qdrant embeddings
+
+**Network Agent** — Interfaces with the EVPN-VXLAN fabric:
+- Queries BGP neighbor state via eAPI
+- Retrieves interface statistics from Prometheus
+- Fetches EVPN route tables
+- Connects to CVP telemetry for real-time state
+- Triggers Ansible remediation playbooks
+
+### 13.3 Agent Communication Flow
+
+```
+User Query: "Check if BGP is healthy on LEAF-01 and find relevant
+             Quranic verses about patience during difficulty"
+
+    │
+    ▼
+┌─────────────┐
+│  PLANNER    │ → Decomposes into 2 parallel tasks
+└──────┬──────┘
+       │
+  ┌────┴──────────────────────┐
+  │                           │
+  ▼                           ▼
+┌──────────────┐    ┌──────────────┐
+│ NETWORK      │    │ RAG AGENT    │
+│ AGENT        │    │ (Quran)      │
+│              │    │              │
+│ eAPI query   │    │ Semantic     │
+│ to LEAF-01   │    │ search for   │
+│ BGP state    │    │ "patience    │
+│              │    │  difficulty" │
+└──────┬───────┘    └──────┬───────┘
+       │                   │
+       ▼                   ▼
+   BGP: 4/4            Verses: Quran 2:153,
+   Established         94:5-6, 39:10
+       │                   │
+       └─────────┬─────────┘
+                 ▼
+         ┌───────────────┐
+         │  SYNTHESIZER  │ → Combined response
+         └───────────────┘
+```
+
+### 13.4 Implementation on Intel Node
+
+```python
+# agent_controller.py — Multi-Agent Orchestrator
+
+from fastapi import FastAPI
+import requests
+from qdrant_client import QdrantClient
+
+app = FastAPI()
+qdrant = QdrantClient(host="192.168.86.124", port=6333)
+
+AGENTS = {
+    "network": {
+        "capabilities": ["bgp_check", "interface_stats", "evpn_state"],
+        "endpoint": "http://localhost:8001/network"
+    },
+    "rag": {
+        "capabilities": ["quran_search", "arabic_nlp", "scholarly_text"],
+        "endpoint": "http://localhost:8002/rag"
+    },
+    "tools": {
+        "capabilities": ["web_crawl", "api_call", "code_exec"],
+        "endpoint": "http://localhost:8003/tools"
+    }
+}
+
+@app.post("/query")
+async def handle_query(request: dict):
+    user_query = request["query"]
+
+    # Step 1: Planner decomposes the query
+    plan = await planner_decompose(user_query)
+
+    # Step 2: Route sub-tasks to agents in parallel
+    results = await execute_agents(plan["tasks"])
+
+    # Step 3: Synthesize final response
+    response = await synthesize(results, user_query)
+
+    return {"response": response, "agent_traces": results}
+```
+
+### 13.5 Classical Arabic RAG Dataset
+
+The RAG agent draws from a curated dataset of classical Arabic reference texts, built on GPU Node 2 in a conda environment (`rag`) at `~/ai_agents/datasets/classical_arabic/`:
+
+| Source | Description |
+|--------|------------|
+| Lane's Lexicon | Comprehensive Arabic-English dictionary |
+| Lisan al-Arab | Authoritative Arabic language dictionary |
+| Mufradat al-Raghib | Quranic vocabulary analysis |
+| Tafsir Ibn Kathir | Classical Quran commentary |
+| Quran Corpus | Morphological analysis database |
+| OpenITI Repository | Digital corpus of classical Islamic texts |
+
+---
+
+## 14. Phase 13: Kubernetes + Calico BGP — Fabric-to-AI Bridge <a name="16-phase-13-k8s"></a>
+
+### 14.1 Architecture Vision
+
+Kubernetes with Calico BGP creates a bridge between the EVPN-VXLAN network fabric and the AI workloads, enabling pod IPs to be advertised directly into the fabric routing table.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│               KUBERNETES + EVPN-VXLAN INTEGRATION           │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │              K3s CLUSTER                             │    │
+│  │                                                     │    │
+│  │  ┌───────────┐  ┌───────────┐  ┌───────────┐       │    │
+│  │  │Intel Node │  │ GPU Node1 │  │ GPU Node2 │       │    │
+│  │  │ (Control) │  │ (Worker)  │  │ (Worker)  │       │    │
+│  │  │ .124      │  │ .56       │  │ .118      │       │    │
+│  │  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘       │    │
+│  │        │               │               │            │    │
+│  │  ┌─────▼───────────────▼───────────────▼──────┐     │    │
+│  │  │            CALICO CNI + BGP                │     │    │
+│  │  │        Pod CIDR: 10.42.0.0/16              │     │    │
+│  │  │     Advertises routes via BGP              │     │    │
+│  │  └──────────────────┬─────────────────────────┘     │    │
+│  └─────────────────────│───────────────────────────┘    │
+│                        │                                │
+│  ┌─────────────────────▼───────────────────────────┐    │
+│  │            EVPN-VXLAN FABRIC                     │    │
+│  │                                                  │    │
+│  │  ┌──────────┐              ┌──────────┐          │    │
+│  │  │ SPINE-01 │              │ SPINE-02 │          │    │
+│  │  │ AS 65000 │              │ AS 65000 │          │    │
+│  │  └────┬─────┘              └────┬─────┘          │    │
+│  │       │  ╲                  ╱   │                │    │
+│  │  ┌────┴───┐              ┌────┴───┐              │    │
+│  │  │LEAF-01 │              │LEAF-02 │              │    │
+│  │  │Eth3→   │              │Eth3→   │              │    │
+│  │  │GPU1    │              │GPU2    │              │    │
+│  │  └────────┘              └────────┘              │    │
+│  └──────────────────────────────────────────────────┘    │
+│                                                          │
+│  Traffic Flow:                                           │
+│  Pod IP → Calico BGP → Leaf → Spine → VXLAN → GPU Node  │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 14.2 K3s Installation
+
+K3s provides a lightweight Kubernetes distribution suitable for lab environments.
+
+**On Intel Node (Control Plane):**
+
+```bash
+curl -sfL https://get.k3s.io | sh -
+cat /var/lib/rancher/k3s/server/node-token
+```
+
+**On GPU Nodes (Workers):**
+
+```bash
+curl -sfL https://get.k3s.io | K3S_URL=https://192.168.86.124:6443 \
+  K3S_TOKEN=<token> sh -
+```
+
+### 14.3 Calico CNI with BGP
+
+Replace K3s default CNI with Calico for BGP route advertisement:
+
+```bash
+kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+```
+
+**Enable BGP peering with EVPN fabric:**
+
+```bash
+calicoctl apply -f - << EOF
+apiVersion: projectcalico.org/v3
+kind: BGPConfiguration
+metadata:
+  name: default
+spec:
+  logSeverityScreen: Info
+  nodeToNodeMeshEnabled: true
+  asNumber: 65200
+EOF
+```
+
+**Peer with Leaf switches:**
+
+```bash
+calicoctl apply -f - << EOF
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: leaf-01
+spec:
+  peerIP: 192.168.86.110
+  asNumber: 65101
+EOF
+```
+
+### 14.4 End-to-End Traffic Flow
+
+When a Kubernetes pod on GPU Node 2 serves an inference request:
+
+1. Client sends request to service IP
+2. Calico BGP advertises pod CIDR into the fabric
+3. LEAF-02 learns the route via BGP peering with Calico
+4. Traffic traverses the EVPN-VXLAN overlay to reach the pod
+5. vLLM processes the inference request
+6. Response returns via the same fabric path
+
+This architecture enables any device on the network to reach AI services natively through the EVPN-VXLAN fabric, without NAT or port forwarding.
+
+### 14.5 GPU Node Integration with Leaf Switches
+
+LEAF-01 Eth3 connects to GPU Node 1, and LEAF-02 Eth3 connects to GPU Node 2, with VLANs 10, 20, 30, and 100 for service segmentation:
+
+| VLAN | Purpose | Subnet |
+|------|---------|--------|
+| 10 | Management | 192.168.86.0/24 |
+| 20 | AI Inference | 10.20.0.0/24 |
+| 30 | Training Data | 10.30.0.0/24 |
+| 100 | Storage/Backup | 10.100.0.0/24 |
+
+---
+
+## 15. Challenges Encountered and Resolutions <a name="12-challenges"></a>
 
 ### 12.1 Infrastructure Challenges
 
@@ -705,60 +1381,137 @@ Initial OPA rules were too restrictive, blocking valid remediations.
 
 ---
 
-## 13. Final Service Map and Verification <a name="13-final-map"></a>
+## 16. Final Architecture — Complete System Map <a name="13-final-map"></a>
 
-### 13.1 Complete Service Map
-
-| Service | IP Address | Port | Status |
-|---------|-----------|------|--------|
-| Windows DC01 (AD/DNS/DHCP/CA) | 192.168.86.10 | — | Running |
-| Infoblox NIOS (DDI/IPAM) | 192.168.86.51 | 443 | Running |
-| CloudVision Portal | 192.168.86.55 | 443/9910 | 4 switches Active |
-| NetBox (DCIM/IPAM) | 192.168.86.60 | 8000 | Running |
-| Grafana (Dashboards) | 192.168.86.60 | 3000 | Running |
-| Prometheus (Metrics) | 192.168.86.60 | 9090 | Running |
-| Alertmanager | 192.168.86.60 | 9093 | Running |
-| Ansible AVD | 192.168.86.70 | SSH | Ready |
-| OPA/Rego (Policy) | 192.168.86.70 | 8181 | Running |
-| n8n (Workflows) | 192.168.86.90 | 5678 | Running |
-| MCP (AI Bridge) | 192.168.86.90 | 8088 | Running |
-| SPINE-01 | 192.168.86.100 | 443 | Streaming to CVP |
-| SPINE-02 | 192.168.86.101 | 443 | Streaming to CVP |
-| LEAF-01 | 192.168.86.110 | 443 | Streaming to CVP |
-| LEAF-02 | 192.168.86.111 | 443 | Streaming to CVP |
-
-### 13.2 Fabric Verification
+### 16.1 Complete System Diagram
 
 ```
-SPINE-01# show bgp summary
-  Neighbor    AS    State   PfxRcd
-  10.10.0.41  65101 Estab   5
-  10.10.0.45  65102 Estab   5
-  10.255.0.11 65101 Estab   0  (EVPN)
-  10.255.0.12 65102 Estab   0  (EVPN)
+┌──────────────────────────────────────────────────────────────────────────┐
+│                                                                          │
+│                    ENTERPRISE AIOps LAB — FULL STACK                     │
+│                                                                          │
+│  ┌──────────────────────────────────────────────────────────────────┐    │
+│  │                    IDENTITY & DNS LAYER                          │    │
+│  │  ┌────────────────┐          ┌────────────────┐                 │    │
+│  │  │ Windows DC01   │          │  Infoblox NIOS │                 │    │
+│  │  │ 192.168.86.10  │          │  192.168.86.51 │                 │    │
+│  │  │ AD/DNS/DHCP/CA │          │  DDI/IPAM      │                 │    │
+│  │  └────────────────┘          └────────────────┘                 │    │
+│  └──────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  ┌──────────────────────────────────────────────────────────────────┐    │
+│  │                   EVPN-VXLAN FABRIC LAYER                        │    │
+│  │          ┌──────────┐              ┌──────────┐                  │    │
+│  │          │ SPINE-01 │              │ SPINE-02 │                  │    │
+│  │          │ AS 65000 │              │ AS 65000 │                  │    │
+│  │          │  .100    │              │  .101    │                  │    │
+│  │          └───┬──┬───┘              └───┬──┬───┘                  │    │
+│  │              │  │ ╲                ╱   │  │                      │    │
+│  │         ┌────┘  └──╲──────────────╱───┘  └────┐                 │    │
+│  │         │           ╲            ╱            │                  │    │
+│  │    ┌────┴─────┐      ╲          ╱      ┌─────┴────┐             │    │
+│  │    │ LEAF-01  │       ╲        ╱       │ LEAF-02  │             │    │
+│  │    │ AS 65101 │        ╲      ╱        │ AS 65102 │             │    │
+│  │    │  .110    │         ╲    ╱         │  .111    │             │    │
+│  │    │  Eth3────┼──────────╳───╳─────────┼────Eth3  │             │    │
+│  │    └──────────┘        eBGP Mesh        └──────────┘             │    │
+│  └──────────────────────────────────────────────────────────────────┘    │
+│           │                                        │                     │
+│  ┌────────▼────────────────────────────────────────▼──────────────┐      │
+│  │                    AI/ML COMPUTE LAYER                         │      │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │      │
+│  │  │ Intel Node   │  │ GPU Node 1   │  │ GPU Node 2   │        │      │
+│  │  │ .124         │  │ .56          │  │ .118         │        │      │
+│  │  │ RAG + Agents │  │ Training     │  │ Inference    │        │      │
+│  │  │ Qdrant       │  │ LoRA/Qwen    │  │ vLLM         │        │      │
+│  │  │ K8s Control  │  │ K8s Worker   │  │ K8s Worker   │        │      │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘        │      │
+│  └───────────────────────────────────────────────────────────────┘      │
+│                                                                          │
+│  ┌──────────────────────────────────────────────────────────────────┐    │
+│  │                  OPERATIONS & AUTOMATION LAYER                    │    │
+│  │                                                                  │    │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐           │    │
+│  │  │ CVP      │ │ NetBox   │ │ Grafana  │ │ Prometheus│           │    │
+│  │  │ .55      │ │ .60:8000 │ │ .60:3000 │ │ .60:9090 │           │    │
+│  │  │ Telemetry│ │ SoT/DCIM │ │ Dashboards│ │ Metrics  │           │    │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘           │    │
+│  │                                                                  │    │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐           │    │
+│  │  │ Ansible  │ │ n8n      │ │ OPA/Rego │ │ MCP      │           │    │
+│  │  │ AVD .70  │ │ .90:5678 │ │ .70:8181 │ │ .90:8088 │           │    │
+│  │  │ IaC      │ │ Workflows│ │ Policy   │ │ AI Bridge│           │    │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘           │    │
+│  └──────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  ┌──────────────────────────────────────────────────────────────────┐    │
+│  │                   CLOSED-LOOP AIOps PIPELINE                     │    │
+│  │                                                                  │    │
+│  │  Grafana ──▶ Alertmanager ──▶ n8n ──▶ Claude AI                 │    │
+│  │    Alert       Route          Orchestrate  Analyze               │    │
+│  │                                  │                               │    │
+│  │                                  ▼                               │    │
+│  │  Prometheus ◀── Ansible ◀── Slack/Auto ◀── OPA/Rego             │    │
+│  │    Verify      Remediate     Approve        Policy Check         │    │
+│  │                                                                  │    │
+│  └──────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  ┌──────────────────────────────────────────────────────────────────┐    │
+│  │                   MULTI-AGENT AI LAYER                           │    │
+│  │                                                                  │    │
+│  │  ┌──────────────────────────────────────────────────────┐       │    │
+│  │  │              PLANNER AGENT (Intel Node)              │       │    │
+│  │  └────────┬───────────────┬────────────────┬────────────┘       │    │
+│  │           │               │                │                    │    │
+│  │   ┌───────▼──────┐ ┌─────▼──────┐  ┌──────▼───────┐           │    │
+│  │   │ Tool Agent   │ │ RAG Agent  │  │Network Agent │           │    │
+│  │   │ Web/API/Code │ │ Quran/     │  │ BGP/EVPN/    │           │    │
+│  │   │              │ │ Arabic NLP │  │ CVP/Ansible  │           │    │
+│  │   └──────────────┘ └────────────┘  └──────────────┘           │    │
+│  └──────────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 13.3 One-Line Fabric Deploy
+### 16.2 Complete Service Map
 
-```bash
-cd /root && source avd-venv/bin/activate && \
-ansible-playbook build.yml -i inventory.yml && \
-ansible-playbook push_merge.yml -i inventory.yml && \
-ansible-playbook verify_fabric.yml -i inventory.yml
-```
+| Layer | Service | IP:Port | Technology |
+|-------|---------|---------|-----------|
+| Identity | Active Directory / DNS / DHCP / CA | 192.168.86.10 | Windows Server 2025 |
+| Identity | DDI / IPAM | 192.168.86.51:443 | Infoblox NIOS 8.2.4 |
+| Fabric | SPINE-01 (BGP RR) | 192.168.86.100:443 | Arista vEOS 4.35.1F |
+| Fabric | SPINE-02 (BGP RR) | 192.168.86.101:443 | Arista vEOS 4.35.1F |
+| Fabric | LEAF-01 (VTEP) | 192.168.86.110:443 | Arista vEOS 4.35.1F |
+| Fabric | LEAF-02 (VTEP) | 192.168.86.111:443 | Arista vEOS 4.35.1F |
+| Telemetry | CloudVision Portal | 192.168.86.55:9910 | Arista CVP |
+| SoT | NetBox DCIM | 192.168.86.60:8000 | NetBox + PostgreSQL |
+| Monitoring | Grafana | 192.168.86.60:3000 | Grafana 12.4 |
+| Monitoring | Prometheus | 192.168.86.60:9090 | Prometheus |
+| Monitoring | Alertmanager | 192.168.86.60:9093 | Alertmanager |
+| Automation | Ansible AVD | 192.168.86.70 (SSH) | Ansible + pyavd 6.0.1 |
+| Policy | OPA/Rego | 192.168.86.70:8181 | Open Policy Agent |
+| Workflow | n8n | 192.168.86.90:5678 | n8n + PostgreSQL |
+| AI Bridge | MCP Server | 192.168.86.90:8088 | FastAPI + Python |
+| AI/ML | RAG + Qdrant + Agents | 192.168.86.124:6333 | Qdrant + FastAPI |
+| AI/ML | Training (LoRA) | 192.168.86.56:11434 | Ollama + Qwen2 |
+| AI/ML | Inference (Primary) | 192.168.86.118:8000 | vLLM + Qwen2 |
+| Orchestration | Kubernetes Control | 192.168.86.124:6443 | K3s |
+| CNI | Calico BGP | — | Calico + BGP peering |
 
-### 13.4 Technologies Used
+### 16.3 Technologies Summary
 
-**Network:** Arista vEOS 4.35.1F, EVPN-VXLAN, eBGP, BFD, VXLAN
+**Network:** Arista vEOS 4.35.1F, EVPN-VXLAN, eBGP, BFD, VXLAN, Calico BGP
 **Automation:** Ansible AVD 6.0.1, Python, pyavd, pynetbox, cvprac
-**Monitoring:** Prometheus, Grafana 12.4, Alertmanager, SNMP Exporter
+**Monitoring:** Prometheus, Grafana 12.4, Alertmanager, SNMP Exporter, Blackbox
 **AIOps:** Claude AI, n8n, OPA/Rego, MCP, Slack
-**Infrastructure:** Proxmox VE 9.1, EVE-NG, Docker, ZFS RAIDZ
+**AI/ML:** vLLM, Ollama, Qwen2 1.5B, LoRA fine-tuning, Qdrant, sentence-transformers
+**Multi-Agent:** Planner/Tool/RAG/Network agents, OpenClaw framework
+**Infrastructure:** Proxmox VE 9.1, EVE-NG, Docker, K3s, ZFS RAIDZ
 **Identity:** Windows Server 2025 AD DS, DNS, DHCP, AD CS
 **DDI:** Infoblox NIOS 8.2.4
 **Telemetry:** Arista CloudVision Portal, TerminAttr v1.42.0
 **Source of Truth:** NetBox
+**Classical Arabic NLP:** Lane's Lexicon, Lisan al-Arab, Quran Corpus, OpenITI
 
 ---
 
-*This document represents the complete technical record of building an enterprise-grade AIOps network lab from bare metal to closed-loop self-healing operations.*
+*This document represents the complete technical record of building an enterprise-grade AIOps network lab — from bare metal through EVPN-VXLAN fabric automation, CloudVision telemetry, closed-loop self-healing operations, distributed GPU inference, and multi-agent AI orchestration. The system demonstrates that the boundary between network infrastructure and AI systems is dissolving — and the engineers who can bridge both domains will define the next era of operations.*
