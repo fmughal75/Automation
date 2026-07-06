@@ -278,3 +278,8 @@ Research Proposal: Submitted to Dr. Muhammad Jaseemuddin, NEAR Lab, TMU
 AQUA-FW is open-source research. All code is available for academic use, reproduction, and extension. If you are a PhD student or researcher at TMU's NEAR Lab, please reach out — collaboration is the goal.
 Faisal Mughal, M.Eng (Computer Networks, Toronto Metropolitan University, formerly Ryerson University, 2009)
 March 2026
+[
+
+![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21225084.svg)
+
+](https://doi.org/10.5281/zenodo.21225084)
